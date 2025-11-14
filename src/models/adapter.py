@@ -127,6 +127,8 @@ class UnifiedAdapterModel(nn.Module):
         self.num_classes = int(num_classes)
 
         d = int(backbone.embed_dim)
+        
+        self._keys_to_ignore_on_save = None
 
         # --- adapter 선택 ---
         if adapter_type == "tconv":

@@ -1,37 +1,41 @@
-# /scripts/train.py
 import os
 import torch
-from transformers import set_seed
-from src import ClipBackbone, UnifiedAdapterModel
-from src import (
-    prepare_deepfake_dataset,
-    attach_clip_transforms,
-    collate_fn,
-)
+from transformers import set_seed, TrainingArguments, Trainer
+from transformers.trainer_utils import get_last_checkpoint
+import torch.nn.functional as F
 import evaluate
 import numpy as np
-import torch.nn.functional as F
-from transformers import TrainingArguments, Trainer
-from transformers.trainer_utils import get_last_checkpoint
 
+from src import ClipBackbone, UnifiedAdapterModel
+from src import prepare_deepfake_dataset
+from src import attach_media_transforms
+from src import collate_fn
 
 def main():
-    # 1️⃣ 시드 설정
     set_seed(42)
     use_bf16 = False
 
-    # 2️⃣ 데이터 로드
-    train_data, test_data, label2id, id2label, class_labels = prepare_deepfake_dataset(
-        hf_path="Hemg/deepfake-and-real-images",
+    # 1 데이터 로드 (이미지 데이터셋이면 이대로 OK)
+    train_data, test_data, label2id, id2label, class_labels, image_key, video_key = prepare_deepfake_dataset(
+        data_path=None,
         split="train",
-        test_size=0.4,
-        seed=42
+        data_files="/root/workspace/baseline/metadata.tsv",
+        delimiter="\t",
+        test_size=seed=42,
     )
-    attach_clip_transforms(train_data, test_data,
-                           clip_model_name="openai/clip-vit-large-patch14",
-                           do_face_crop=True, rotation_deg=15)
 
-    # 3️⃣ 모델 구성
+    # 2 전처리 훅 부착 (이미지는 (1,3,H,W)로, 비디오는 (T,3,H,W)로 나오게)
+    attach_media_transforms(
+        train_data, test_data,
+        image_key=image_key,          
+        video_key=video_key,           
+        clip_model_name="openai/clip-vit-large-patch14",
+        do_face_crop=False,
+        rotation_deg=15,
+        num_frames=12,
+    )
+
+    # 3 모델
     backbone = ClipBackbone(
         model_name="openai/clip-vit-large-patch14",
         dtype="fp32",
@@ -39,8 +43,7 @@ def main():
     )
     model = UnifiedAdapterModel(
         backbone=backbone,
-        num_frames=12,
-        adapter_type="tconv",
+        num_frames=12,              
         temporal_pool="mean",
         head_hidden=1024,
         num_classes=len(class_labels.names),
@@ -48,7 +51,7 @@ def main():
         label2id=label2id,
     )
 
-    # 4️⃣ 메트릭 정의
+    # 4) 메트릭 (이진 전제)
     acc_metric = evaluate.load("accuracy")
     auc_metric = evaluate.load("roc_auc")
 
@@ -57,27 +60,30 @@ def main():
         probs = torch.from_numpy(logits).softmax(dim=1).numpy()
         preds = probs.argmax(axis=1)
         acc = acc_metric.compute(predictions=preds, references=labels)["accuracy"]
-        auc = auc_metric.compute(prediction_scores=probs[:, 1], references=labels, average="macro")["roc_auc"]
+        auc = auc_metric.compute(
+            prediction_scores=probs[:, 1], references=labels, average="macro"
+        )["roc_auc"]
         return {"accuracy": acc, "roc_auc": auc}
 
-    # 5️⃣ Trainer 클래스 정의
+
     class AdapterTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-            x = inputs["pixel_values"]
-            y = inputs["labels"].long()
-            logits = model(x)
+            x = inputs["pixel_values"]         # (B,T,3,H,W)
+            y = inputs["labels"].long()        # (B,)
+            logits = model(x)                  # (B,num_classes)
             loss = F.cross_entropy(logits, y, label_smoothing=0.1)
             return (loss, {"logits": logits}) if return_outputs else loss
 
+
     args = TrainingArguments(
-        output_dir="../outputs",
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        output_dir="./outputs_video",
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
         learning_rate=1e-4,
-        num_train_epochs=5,
+        num_train_epochs=10,
         weight_decay=0.02,
         warmup_ratio=0.1,
-        eval_strategy="epoch",
+        eval_strategy="epoch",   
         save_strategy="epoch",
         save_safetensors=False,
         load_best_model_at_end=True,
@@ -97,18 +103,25 @@ def main():
         args=args,
         train_dataset=train_data,
         eval_dataset=test_data,
-        data_collator=collate_fn,
+        data_collator=collate_fn,  
         compute_metrics=compute_metrics,
     )
 
-    last_ckpt = get_last_checkpoint(args.output_dir)
-    if last_ckpt is not None:
-        print(f">> resume from {last_ckpt}")
-        trainer.train(resume_from_checkpoint=last_ckpt)
-    else:
-        print(">> start fresh training")
-        trainer.train()
+    ckpt_bin = "/root/workspace/baseline/outputs/checkpoint-35690/pytorch_model.bin"
 
+    if os.path.exists(ckpt_bin):
+        print(f">> load pretrained weights from {ckpt_bin}")
+        state_dict = torch.load(ckpt_bin, map_location="cpu")
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print("   - missing keys   :", missing)
+        print("   - unexpected keys:", unexpected)
+        print(">> start finetuning on video dataset from loaded weights")
+    else:
+        print(">> checkpoint bin not found, train from scratch")
+
+    # 👉 중요: 더 이상 resume_from_checkpoint 쓰지 않음
+    trainer.train()
 
 if __name__ == "__main__":
     main()
