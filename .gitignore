@@ -1,4 +1,18 @@
 model/**/*.safetensors
 model/**/*.bin
 model/**/*.pth
+
+# datasets / generated data
 train_data/
+outputs*/
+
+# python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# notebooks
+.ipynb_checkpoints/
+
+# misc
+.DS_Store

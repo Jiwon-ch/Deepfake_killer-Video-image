@@ -15,12 +15,12 @@ def main():
     set_seed(42)
     use_bf16 = False
     seed = 42
-    test_size=seed
+    test_size = 0.2
     # 1 데이터 로드 (이미지 데이터셋이면 이대로 OK)
     train_data, test_data, label2id, id2label, class_labels, image_key, video_key = prepare_deepfake_dataset(
         data_path=None,
         split="train",
-        data_files="/workspace/jiwon/Deepfake_killer-Video-image/train_data/metadata.tsv",
+        data_files="/root/train_data/subset/metadata.tsv",
         delimiter="\t",
         seed=seed,
         test_size=test_size,
@@ -34,7 +34,7 @@ def main():
         clip_model_name="openai/clip-vit-large-patch14",
         do_face_crop=False,
         rotation_deg=15,
-        num_frames=12,
+        num_frames=16,
     )
 
     # 3 모델
@@ -55,7 +55,7 @@ def main():
             attn_dropout=0.1,
         ),
         temporal_pool="attn",
-        head_hidden=1024,
+        head_hidden=(2048, 1024),
         num_classes=len(class_labels.names),
         id2label=id2label,
         label2id=label2id,
@@ -93,13 +93,13 @@ def main():
 
     args = TrainingArguments(
         output_dir="./outputs_video",
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
         learning_rate=1e-4,
         num_train_epochs=10,
         weight_decay=0.02,
         warmup_ratio=0.1,
-        eval_strategy="epoch",   
+        evaluation_strategy="epoch",
         save_strategy="epoch",
         save_safetensors=False,
         load_best_model_at_end=True,
@@ -123,7 +123,7 @@ def main():
         compute_metrics=compute_metrics,
     )
 
-    ckpt_bin = "/root/workspace/baseline/outputs/checkpoint-35690/pytorch_model.bin"
+    ckpt_bin = "/root/jiwon/outputs/checkpoint-35690/pytorch_model.bin"
 
     if os.path.exists(ckpt_bin):
         print(f">> load pretrained weights from {ckpt_bin}")

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Literal, Optional, Dict, Tuple, Any
+from typing import Literal, Optional, Dict, Tuple, Any, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -154,14 +154,34 @@ class TemporalAttentionPool(nn.Module):
 # MLP Head
 # ----------------------------
 class MLPHead(nn.Module):
-    def __init__(self, d_in: int, hidden: int = 1024, num_classes: int = 2, p: float = 0.1):
+    def __init__(
+        self,
+        d_in: int,
+        hidden: int | Sequence[int] | None = 1024,
+        num_classes: int = 2,
+        p: float = 0.1,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_in, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p),
-            nn.Linear(hidden, num_classes),
-        )
+
+        # hidden이 int/시퀀스/None 모두 허용되도록 정규화
+        if hidden is None:
+            hidden_dims: Tuple[int, ...] = ()
+        elif isinstance(hidden, Sequence) and not isinstance(hidden, (str, bytes)):
+            hidden_dims = tuple(int(h) for h in hidden if int(h) > 0)
+        else:
+            h = int(hidden)
+            hidden_dims = (h,) if h > 0 else ()
+
+        layers: list[nn.Module] = []
+        in_dim = d_in
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(p))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.net = nn.Sequential(*layers)
+
         # 초기화
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -194,7 +214,7 @@ class UnifiedAdapterModel(nn.Module):
         num_frames: int = 12,
         adapter_type: Literal["tconv", "transformer", "none"] = "tconv",
         temporal_pool: Literal["mean", "attn"] = "mean",
-        head_hidden: int = 1024,
+        head_hidden: int | Sequence[int] | None = 1024,
         num_classes: int = 2,
         chunk_size: Optional[int] = None,            # (B*T) 인코딩 시 슬라이스 크기 (VRAM 절약)
         id2label: Optional[Dict[int, str]] = None,   # 선택: 라벨 맵 저장용

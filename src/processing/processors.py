@@ -160,9 +160,9 @@ def build_media_transforms(
 ) -> Tuple[Callable, Callable]:
     """
     반환: (train_transform, val_transform)
-    모든 샘플을 **고정된 T**로 맞춤:
+    모든 비디오 샘플을 **고정된 T**로 맞춤:
       - 비디오: pixel_values = (T,3,H,W)
-      - 이미지: pixel_values = (T,3,H,W)  ← 단일 프레임을 num_frames만큼 복제
+      - 이미지: pixel_values = (3,H,W)  ← 필요 시 collate_fn 내부에서 (1,3,H,W)로 확장
     """
     size = processor.size.get("shortest_edge", processor.size.get("height", 224))
     mean, std = processor.image_mean, processor.image_std
@@ -184,7 +184,6 @@ def build_media_transforms(
         tfm = train_img_tfm if train else val_img_tfm
         im = _maybe_face_crop(im, do_face_crop)
         t = tfm(im)                         # (3,H,W)
-        t = t.unsqueeze(0).repeat(num_frames, 1, 1, 1)  # (T,3,H,W)로 복제
         return t
 
     def _prep_one_video(path: str, train: bool) -> Optional[torch.Tensor]:
@@ -242,11 +241,15 @@ def build_media_transforms(
 
             # 3) 마지막 방어: 실패 시 스킵 대신 최소 더미(검정 프레임) 생성
             if ten is None:
-                # (T,3,H,W) 제로 텐서 — 배치 스택을 깨지 않기 위함
+                # 제로 텐서 — 배치 스택을 깨지 않기 위함
                 H = W = size
-                ten = torch.zeros((num_frames, 3, H, W), dtype=torch.float32)
+                if candidate_is_video:
+                    ten = torch.zeros((num_frames, 3, H, W), dtype=torch.float32)
+                    media_flag = 1
+                else:
+                    ten = torch.zeros((3, H, W), dtype=torch.float32)
+                    media_flag = 0
                 temporal_len = 1
-                media_flag = 1 if candidate_is_video else 0
 
             pix_list.append(ten)
             media_types.append(media_flag)
