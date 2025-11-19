@@ -299,10 +299,10 @@ class UnifiedAdapterModel(nn.Module):
     # 내부 헬퍼
     # ----------------------------
     def _ensure_5d(self, x: torch.Tensor) -> torch.Tensor:
-        """이미지(4D)->비디오(5D)로 확장. 비디오는 그대로."""
+        """이미지(4D)->비디오(5D)로 축(+1 frame). 비디오는 그대로."""
         if x.ndim == 4:
-            # (B,3,H,W)->(B,T,3,H,W), 동일 프레임 복제
-            x = x.unsqueeze(1).repeat(1, self.num_frames, 1, 1, 1)
+            # (B,3,H,W)->(B,1,3,H,W), 불필요한 프레임 반복 제거
+            x = x.unsqueeze(1)
         elif x.ndim != 5:
             raise ValueError(f"입력 텐서 차원 오류: (B,3,H,W) 또는 (B,T,3,H,W) 필요, 현재={tuple(x.shape)}")
         return x
