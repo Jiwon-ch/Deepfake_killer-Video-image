@@ -6,7 +6,8 @@ from PIL import Image
 
 import torch
 from torchvision.transforms import (
-    Compose, Resize, RandomRotation, RandomAdjustSharpness, ToTensor, Normalize
+    Compose, Resize, RandomRotation, RandomAdjustSharpness, ToTensor, Normalize,
+    RandomHorizontalFlip, RandomAffine, GaussianBlur, ColorJitter
 )
 from transformers import CLIPImageProcessor
 
@@ -60,6 +61,24 @@ def _maybe_face_crop(img: Image.Image, enable: bool) -> Image.Image:
     x, y, size = _get_boundingbox(face, w, h)
     cropped = np_img[y:y + size, x:x + size]
     return Image.fromarray(cropped)
+
+
+class RandomJPEGCompression:
+    """
+    JPEG compression augmentation via PIL re-encode.
+    """
+    def __init__(self, quality_range=(40, 80), p=0.5):
+        self.qmin, self.qmax = quality_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if np.random.rand() > self.p:
+            return img
+        buf = io.BytesIO()
+        q = np.random.randint(self.qmin, self.qmax + 1)
+        img.save(buf, format="JPEG", quality=int(q))
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
 
 
 # --------------------------
@@ -153,9 +172,10 @@ def build_media_transforms(
     *,
     image_key: Optional[str] = "image",
     video_key: Optional[str] = "video_path",
-    do_face_crop: bool = False,
+    do_face_crop: bool = True,
     rotation_deg: int = 15,
     num_frames: int = 12,
+    num_frames_val: Optional[int] = None,
     video_strategy: str = "uniform",
 ) -> Tuple[Callable, Callable]:
     """
@@ -163,14 +183,20 @@ def build_media_transforms(
     모든 비디오 샘플을 **고정된 T**로 맞춤:
       - 비디오: pixel_values = (T,3,H,W)
       - 이미지: pixel_values = (3,H,W)  ← 필요 시 collate_fn 내부에서 (1,3,H,W)로 확장
+    num_frames_val가 주어지면 평가 시 별도 프레임 개수를 사용.
     """
     size = processor.size.get("shortest_edge", processor.size.get("height", 224))
     mean, std = processor.image_mean, processor.image_std
 
     train_img_tfm = Compose([
         Resize((size, size)),
+        RandomHorizontalFlip(),
+        RandomAffine(degrees=10, translate=(0.02, 0.02), scale=(0.95, 1.05), shear=5),
         RandomRotation(rotation_deg),
+        ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
         RandomAdjustSharpness(2.0),
+        RandomJPEGCompression(quality_range=(40, 80), p=0.5),
         ToTensor(),
         Normalize(mean=mean, std=std),
     ])
@@ -187,8 +213,9 @@ def build_media_transforms(
         return t
 
     def _prep_one_video(path: str, train: bool) -> Optional[torch.Tensor]:
+        nf = num_frames if train else (num_frames_val or num_frames)
         frames = sample_video_frames_to_pil(
-            path, num_frames=num_frames, strategy=video_strategy
+            path, num_frames=nf, strategy=video_strategy
         )
         if frames is None:
             return None
@@ -275,6 +302,7 @@ def attach_media_transforms(
     do_face_crop: bool = False,
     rotation_deg: int = 15,
     num_frames: int = 12,
+    num_frames_val: Optional[int] = None,
     video_strategy: str = "uniform",
 ):
 
@@ -286,6 +314,7 @@ def attach_media_transforms(
         do_face_crop=do_face_crop,
         rotation_deg=rotation_deg,
         num_frames=num_frames,
+        num_frames_val=num_frames_val,
         video_strategy=video_strategy,
     )
     train_data.set_transform(train_tfm)

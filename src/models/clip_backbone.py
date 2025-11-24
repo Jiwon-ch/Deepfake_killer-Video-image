@@ -4,11 +4,13 @@ import torch
 import torch.nn as nn
 from transformers import CLIPModel
 
+
 class ClipBackbone(nn.Module):
     """
     CLIP ViT-L/14 백본 래퍼
       - forward_images: (B,3,H,W) → (B,D)
-      - freeze / unfreeze_last_n_blocks 지원
+      - CLS 토큰만 반환할지 여부(use_cls_token) 선택
+      - freeze / unfreeze_last_n_blocks / LayerNorm-only 학습 지원
       - strict 로더 호환: text/vision의 position_ids를 강제 등록 + state_dict에 alias 키 복제
     """
     def __init__(
@@ -17,6 +19,8 @@ class ClipBackbone(nn.Module):
         dtype: Literal["fp32", "bf16", "fp16"] = "fp32",
         freeze_backbone: bool = True,
         unfreeze_last_n_blocks: int = 0,  # 0이면 완전 동결
+        use_cls_token: bool = False,      # True면 projection 없이 CLS 토큰(1024차원) 반환
+        train_layer_norm_only: bool = False,  # True면 LayerNorm 파라미터만 학습
     ):
         super().__init__()
 
@@ -30,10 +34,15 @@ class ClipBackbone(nn.Module):
         self.vision = self.clip.vision_model
         self.visual_projection = self.clip.visual_projection
 
-        # 임베딩 차원(visual projection 출력 차원)
-        self.embed_dim = getattr(self.clip.config, "projection_dim", None)
-        if self.embed_dim is None:
-            self.embed_dim = self.vision.config.hidden_size  # fallback
+        self.use_cls_token = bool(use_cls_token)
+
+        # 임베딩 차원
+        if self.use_cls_token:
+            self.embed_dim = self.vision.config.hidden_size  # CLS 토큰 차원(1024)
+        else:
+            self.embed_dim = getattr(self.clip.config, "projection_dim", None)
+            if self.embed_dim is None:
+                self.embed_dim = self.vision.config.hidden_size  # fallback
 
         # 버전 차이 대비: position_ids 강제 등록(텍스트/비전)
         self._ensure_position_ids()
@@ -58,6 +67,13 @@ class ClipBackbone(nn.Module):
             for blk in blocks[-unfreeze_last_n_blocks:]:
                 for p in blk.parameters():
                     p.requires_grad = True
+
+        # LayerNorm만 학습하도록 설정(논문 설정: 나머지는 동결)
+        if train_layer_norm_only:
+            for m in self.clip.modules():
+                if isinstance(m, nn.LayerNorm):
+                    for p in m.parameters():
+                        p.requires_grad = True
 
     def _ensure_position_ids(self) -> None:
         """HF/환경 버전에 따라 state_dict에 없을 수 있는 position_ids를 강제로 등록."""
@@ -125,10 +141,14 @@ class ClipBackbone(nn.Module):
         pixel_values = pixel_values.to(device=dev, dtype=dt)
 
         out = self.vision(pixel_values=pixel_values)
+        cls = out.last_hidden_state[:, 0, :]  # (B, hidden)
+        if self.use_cls_token:
+            return cls
+
         pooled = (
             out.pooler_output
             if hasattr(out, "pooler_output") and out.pooler_output is not None
-            else out.last_hidden_state[:, 0, :]
+            else cls
         )
         emb = self.visual_projection(pooled)
         return emb

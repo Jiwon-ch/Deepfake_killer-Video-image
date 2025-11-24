@@ -6,6 +6,7 @@ from .adapter import (
     MLPHead,
 )
 from .clip_backbone import ClipBackbone
+from .lnclip_df import LNCLIPDF
 
 __all__ = [
     "UnifiedAdapterModel",
@@ -14,4 +15,5 @@ __all__ = [
     "TemporalAttentionPool",
     "MLPHead",
     "ClipBackbone",
+    "LNCLIPDF",
 ]

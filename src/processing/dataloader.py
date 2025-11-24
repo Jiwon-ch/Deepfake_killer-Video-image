@@ -11,6 +11,8 @@ from .transforms import collate_fn  # 여기에 '스마트' collate가 있어야
 
 VIDEO_COL_CANDIDATES: List[str] = ["video_path", "video", "filepath", "path", "file"]
 IMAGE_COL_CANDIDATES: List[str] = ["image", "img", "pixel_values"]
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
+VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
 def _pick_first_col(cols: List[str], candidates: List[str]) -> Optional[str]:
@@ -41,12 +43,39 @@ def _derive_label(example) -> Dict:
     return {"label": None}
 
 
+def _split_path_by_modality(example: Dict) -> Dict:
+    """
+    FFPP metadata처럼 path 하나만 있고 modality로 이미지/비디오를 구분하는 경우,
+    명시적인 image / video_path 컬럼을 만들어준다.
+    """
+    path = None
+    for k in ["path", "filepath", "file"]:
+        if k in example:
+            path = example.get(k)
+            if path:
+                break
+    modality = str(example.get("modality", "")).lower()
+    ext = os.path.splitext(path or "")[1].lower()
+
+    is_image = modality.startswith("image") or ext in IMAGE_EXTS
+    is_video = modality.startswith("video") or ext in VIDEO_EXTS
+
+    img_path = path if is_image else ""
+    vid_path = path if is_video else ""
+    # 빈 문자열로 넣어 Arrow가 string 타입으로 고정되도록 한다(None -> null 타입 방지)
+    return {
+        "image": img_path,
+        "video_path": vid_path,
+    }
+
+
 def _has_valid_media_factory(image_key: Optional[str], video_key: Optional[str]):
     def _fn(ex):
         ok_img = False
         ok_vid = False
         if image_key is not None and ex.get(image_key) is not None:
-            ok_img = True
+            img_path = ex.get(image_key)
+            ok_img = True if not isinstance(img_path, str) else os.path.exists(img_path)
         if video_key is not None:
             vp = ex.get(video_key)
             ok_vid = isinstance(vp, str) and len(vp) > 0 and os.path.exists(vp)
@@ -78,10 +107,16 @@ def prepare_deepfake_dataset(
             raise ValueError("data_path 또는 data_files 중 하나는 필요해.")
         ds: Dataset = load_dataset(data_path, split=split, cache_dir=cache_dir)
 
-    cols = ds.column_names
-
     ds = ds.map(_derive_label, batched=False)
     ds = ds.filter(lambda ex: ex["label"] is not None)
+
+    cols = ds.column_names
+
+    # path + modality 조합이면 명시적인 image/video_path 컬럼 생성
+    if ("path" in cols or "filepath" in cols or "file" in cols) and ("modality" in cols):
+        if "image" not in cols and "video_path" not in cols:
+            ds = ds.map(_split_path_by_modality, batched=False)
+            cols = ds.column_names
 
     image_key = _pick_first_col(cols, IMAGE_COL_CANDIDATES)
     video_key = _pick_first_col(cols, VIDEO_COL_CANDIDATES)
