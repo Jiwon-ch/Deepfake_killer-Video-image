@@ -4,11 +4,13 @@ from the training split with the same class ratio, and log logits/preds.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import random
 import sys
 from collections import defaultdict
+from itertools import zip_longest
 from pathlib import Path
 
 import torch
@@ -119,7 +121,7 @@ def load_model(checkpoint_dir, num_classes, device, dtype, classifier_hidden=512
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="outputs_video/checkpoint-3000")
+    parser.add_argument("--checkpoint", default="outputs_video/checkpoint-4000")
     parser.add_argument("--data_files", default="/root/FFPP/metadata.tsv")
     parser.add_argument("--delimiter", default="\t")
     parser.add_argument("--sample_size", type=int, default=400)
@@ -128,6 +130,12 @@ def main():
     parser.add_argument("--num_frames_val", type=int, default=32)
     parser.add_argument("--classifier_hidden", type=int, default=512)
     parser.add_argument("--output", default="outputs_video/sample_eval_400.jsonl")
+    parser.add_argument(
+        "--pretty_output",
+        default=None,
+        help="Optional TSV with ok/label/pred/probabilities for quick inspection "
+        "(defaults to <output>.tsv)",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -145,9 +153,16 @@ def main():
     labels = train_data["label"]
     indices = stratified_sample_indices(labels, args.sample_size, args.seed)
     sampled = train_data.select(indices)
-    # preserve raw paths for logging before transform is applied
-    path_key = video_key if video_key is not None else image_key
-    sample_paths = sampled[path_key] if path_key is not None else [""] * len(sampled)
+    # preserve raw paths for logging before transform is applied (prefer video then image)
+    n_rows = len(sampled)
+    video_paths = sampled[video_key] if video_key is not None else [""] * n_rows
+    image_paths = sampled[image_key] if image_key is not None else [""] * n_rows
+    sample_paths = []
+    for vp, ip in zip_longest(video_paths, image_paths, fillvalue=""):
+        vp = vp or ""
+        ip = ip or ""
+        path = vp if (isinstance(vp, str) and vp) else (ip if isinstance(ip, str) else "")
+        sample_paths.append(path)
 
     # Use eval/val transform (no heavy augmentation)
     processor = get_clip_processor("openai/clip-vit-large-patch14")
@@ -183,11 +198,21 @@ def main():
         collate_fn=collate_fn,
     )
 
+    pretty_output = args.pretty_output
+    if pretty_output is None and args.output:
+        stem, _ext = os.path.splitext(args.output)
+        pretty_output = f"{stem}.tsv"
+
     os.makedirs(Path(args.output).parent, exist_ok=True)
     rows = []
     total = 0
     correct = 0
-    with torch.no_grad(), open(args.output, "w") as f:
+    with torch.no_grad(), contextlib.ExitStack() as stack:
+        f = stack.enter_context(open(args.output, "w"))
+        pretty_f = stack.enter_context(open(pretty_output, "w")) if pretty_output else None
+        if pretty_f is not None:
+            pretty_f.write("idx\tok\tlabel\tpred\tprob_label\tprob_pred\tpath\n")
+
         offset = 0
         for batch in loader:
             pixel_values = batch["pixel_values"].to(device)
@@ -205,6 +230,9 @@ def main():
             for i in range(logits.size(0)):
                 label_id = int(labels_t[i])
                 pred_id = int(preds[i])
+                ok = int(pred_id == label_id)
+                prob_label = float(probs[i, label_id])
+                prob_pred = float(probs[i, pred_id])
                 row = {
                     "index": int(offset + i),
                     "path": sample_paths[offset + i],
@@ -216,15 +244,23 @@ def main():
                     "logit_1": float(logits[i, 1]),
                     "prob_0": float(probs[i, 0]),
                     "prob_1": float(probs[i, 1]),
+                    "correct": bool(ok),
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if pretty_f is not None:
+                    pretty_f.write(
+                        f"{row['index']}\t{ok}\t{row['label']}\t{row['pred']}\t"
+                        f"{prob_label:.6f}\t{prob_pred:.6f}\t{row['path']}\n"
+                    )
                 rows.append(row)
                 total += 1
-                correct += int(pred_id == label_id)
+                correct += ok
             offset += logits.size(0)
 
     acc = correct / max(1, total)
     print(f"[done] wrote {len(rows)} rows to {args.output}")
+    if pretty_output:
+        print(f"[done] wrote readable summary to {pretty_output}")
     print(f"[done] accuracy on sampled set: {acc:.4f}")
 
 

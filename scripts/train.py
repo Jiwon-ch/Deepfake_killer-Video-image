@@ -14,14 +14,14 @@ from src import collate_fn
 def main():
     set_seed(42)
     seed = 42
-    test_size = 0.2
+    test_size = 0.1
     use_bf16 = True
 
     # 1) 데이터 로드
     train_data, test_data, label2id, id2label, class_labels, image_key, video_key = prepare_deepfake_dataset(
         data_path=None,
         split="train",
-        data_files="/root/FFPP/metadata.tsv",
+        data_files="/root/workspace/d.k./metadata.tsv",
         delimiter="\t",
         seed=seed,
         test_size=test_size,
@@ -36,16 +36,17 @@ def main():
         do_face_crop=True,
         rotation_deg=15,
         num_frames=1,
-        num_frames_val=32,
+        num_frames_val=8,
     )
 
-    # 3) 모델: CLS 토큰만 사용, LayerNorm만 학습, 나머지 
+    # 3) 모델: CLS 토큰만 사용, 마지막 비전 블록만 해동
     backbone = ClipBackbone(
         model_name="openai/clip-vit-large-patch14",
         dtype="bf16",
-        freeze_backbone=True,
+        freeze_backbone=True,          # 전체 동결 후,
+        unfreeze_last_n_blocks=1,      # 마지막 비전 블록만 해동
         use_cls_token=True,
-        train_layer_norm_only=True,
+        train_layer_norm_only=False,   # LN-only 해제(해동된 블록 전체 학습)
     )
     model = LNCLIPDF(
         backbone=backbone,
@@ -58,23 +59,6 @@ def main():
     )
     model.id2label = id2label
     model.label2id = label2id
-
-    # Class weights to counter imbalance
-    label_counts = Counter(int(l) for l in train_data["label"])
-    total = sum(label_counts.values())
-    weights = []
-    num_classes = len(class_labels.names)
-    for i in range(num_classes):
-        c = label_counts.get(i, 0)
-        if c == 0:
-            weights.append(0.0)
-        else:
-            # Normalize so mean weight ~1
-            weights.append(total / (num_classes * c))
-    weights_tensor = torch.tensor(weights, dtype=torch.float32)
-    if hasattr(model, "class_weights"):
-        delattr(model, "class_weights")  # remove placeholder to allow buffer registration
-    model.register_buffer("class_weights", weights_tensor)
 
     # 4) 메트릭 (이진 전제)
     acc_metric = evaluate.load("accuracy")
@@ -123,20 +107,63 @@ def main():
                     return super().create_scheduler(num_training_steps=num_training_steps, optimizer=opt)
             return self.lr_scheduler
 
+        def create_optimizer(self):
+            # 두 개의 LR 그룹: 백본(해동된 마지막 블록)과 헤드/나머지
+            if self.optimizer is None:
+                backbone_lr = 1e-5
+                head_lr = self.args.learning_rate
+                decay = self.args.weight_decay
+
+                def is_backbone(n: str) -> bool:
+                    return n.startswith("backbone.")
+
+                no_decay = ("bias", "LayerNorm.weight", "LayerNorm.bias")
+                backbone_params = []
+                head_params = []
+                for n, p in self.model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if any(nd in n for nd in no_decay):
+                        wd = 0.0
+                    else:
+                        wd = decay
+                    if is_backbone(n):
+                        backbone_params.append({"params": [p], "lr": backbone_lr, "weight_decay": wd})
+                    else:
+                        head_params.append({"params": [p], "lr": head_lr, "weight_decay": wd})
+
+                optimizer_grouped_parameters = backbone_params + head_params
+                adam_betas = (self.args.adam_beta1, self.args.adam_beta2)
+                self.optimizer = torch.optim.AdamW(
+                    optimizer_grouped_parameters,
+                    lr=head_lr,
+                    betas=adam_betas,
+                    eps=self.args.adam_epsilon,
+                )
+            return self.optimizer
+
+    # 스텝 기준으로 2 epoch마다 eval/save
+    train_bs = 32
+    eval_bs = 4
+    grad_accum = 1
+    steps_per_epoch = math.ceil(len(train_data) / (train_bs * grad_accum))
+    eval_save_steps = max(1, steps_per_epoch * 2)
+
     args = TrainingArguments(
         output_dir="./outputs_video",
-        per_device_train_batch_size=16,
+        per_device_train_batch_size=train_bs,
         # Eval uses 32 frames per sample, so keep the batch small to avoid OOM kills.
-        per_device_eval_batch_size=1,
+        per_device_eval_batch_size=eval_bs,
+        gradient_accumulation_steps=grad_accum,
         learning_rate=3e-4,
-        num_train_epochs=15,
+        num_train_epochs=10,
         weight_decay=0.0,
         warmup_ratio=0.1,  # 1 epoch warmup (20 epochs total)
         lr_scheduler_type="cosine_with_restarts",
         evaluation_strategy="steps",
-        eval_steps=1000,
+        eval_steps=eval_save_steps,
         save_strategy="steps",
-        save_steps=1000,
+        save_steps=eval_save_steps,
         save_safetensors=False,
         eval_accumulation_steps=2,
         load_best_model_at_end=True,
@@ -161,7 +188,7 @@ def main():
     )
 
     # 사전 가중치 로딩 (옵션)
-    ckpt_bin = "/root/Jiwon/Deepfake_killer-Video-image/outputs_video/checkpoint-2000_1/pytorch_model.bin"
+    ckpt_bin = ""
     if os.path.exists(ckpt_bin):
         print(f">> load pretrained weights from {ckpt_bin}")
         state_dict = torch.load(ckpt_bin, map_location="cpu")

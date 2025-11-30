@@ -18,3 +18,7 @@ __pycache__/
 .DS_Store
 
 *.zip
+
+Inference data/
+test_data/
+*.ipynb
